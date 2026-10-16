@@ -1,0 +1,201 @@
+name: Self-host auto-update
+
+# Daily: merge the latest every-app/open-seo release tag into main when main
+# doesn't contain it yet, run the CI checks, deploy the selfhost stage, push the
+# merge, then verify Cloudflare Access and Managed OAuth still gate the app.
+# The push follows the deploy so main always matches what is live; a run that
+# deploys but fails to push re-merges the same tag next time and redeploys
+# identical code.
+#
+# Required repo secrets:
+# - CLOUDFLARE_API_TOKEN: Workers Scripts, Workers KV Storage, D1, Workers R2
+#   Storage write; Secrets Store read; Account Settings read; Access: Apps and
+#   Policies write; Access: Organizations, Identity Providers, and Groups read.
+# - CLOUDFLARE_ACCOUNT_ID
+# - ENV_SELFHOST: contents of .env.selfhost. After editing it locally, refresh
+#   with `gh secret set ENV_SELFHOST --repo sleekdotdesign/open-seo < .env.selfhost`.
+# - DEPLOY_KEY: private half of a write deploy key. GITHUB_TOKEN can't push
+#   commits that touch .github/workflows, and upstream releases sometimes do.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Deploy even when there is no new upstream release
+        type: boolean
+        default: false
+
+concurrency:
+  group: selfhost-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    if: github.repository == 'sleekdotdesign/open-seo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      UPSTREAM: every-app/open-seo
+      APP_URL: https://open-seo-selfhost.rewebdotso.workers.dev
+
+    steps:
+      # ref: main so a manual run from another branch can't push that branch
+      # onto main.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+          fetch-depth: 0
+
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "+refs/tags/$tag:refs/tags/$tag"
+          if git merge-base --is-ancestor "refs/tags/$tag" HEAD; then merge=false; else merge=true; fi
+          if [ "$merge" = true ] || [ "$FORCE" = true ]; then deploy=true; else deploy=false; fi
+          echo "Latest upstream release $tag: merge=$merge deploy=$deploy (force=$FORCE)"
+          {
+            echo "tag=$tag"
+            echo "merge=$merge"
+            echo "deploy=$deploy"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream release
+        if: steps.decide.outputs.merge == 'true'
+        env:
+          TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          if ! git merge --no-edit -m "Merge upstream release $TAG" "refs/tags/$TAG"; then
+            conflicted=$(git diff --name-only --diff-filter=U | paste -sd ' ' -)
+            echo "::error::Merging $TAG into main failed. Conflicted files: ${conflicted:-none (see log)}. Merge it locally and push."
+            exit 1
+          fi
+
+      - name: Setup pnpm
+        if: steps.decide.outputs.deploy == 'true'
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        if: steps.decide.outputs.deploy == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        if: steps.decide.outputs.deploy == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Run CI checks
+        if: steps.decide.outputs.deploy == 'true'
+        run: pnpm run ci:check
+
+      - name: Run tests
+        if: steps.decide.outputs.deploy == 'true'
+        run: pnpm run test:ci
+
+      # Written after the checks so prettier and knip never see it. Actions
+      # logs are public, so each secret value is masked on its own. Short
+      # values (OPENSEO_TELEMETRY_DISABLED=1) are skipped: masking "1" would
+      # blank every 1 in the log.
+      - name: Write .env.selfhost
+        if: steps.decide.outputs.deploy == 'true'
+        env:
+          ENV_SELFHOST: ${{ secrets.ENV_SELFHOST }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            case "$line" in '' | [!A-Za-z_]*) continue ;; esac
+            [[ "$line" == *=* ]] || continue
+            value="${line#*=}"
+            value="${value#\"}"
+            value="${value%\"}"
+            value="${value#\'}"
+            value="${value%\'}"
+            if [ "${#value}" -ge 8 ]; then
+              echo "::add-mask::$value"
+            fi
+          done <<< "$ENV_SELFHOST"
+          umask 077
+          printf '%s\n' "$ENV_SELFHOST" > .env.selfhost
+
+      - name: Deploy selfhost stage
+        if: steps.decide.outputs.deploy == 'true'
+        run: pnpm deploy:selfhost --yes
+
+      - name: Push merge
+        if: steps.decide.outputs.merge == 'true'
+        run: git push origin HEAD:main
+
+      # Managed OAuth makes Access answer 401 to non-browser requests, so only
+      # a browser-like request gets the login redirect. A definitive app
+      # response without that redirect fails immediately; retries cover
+      # propagation-era errors.
+      - name: Verify Access protection
+        if: steps.decide.outputs.deploy == 'true'
+        run: |
+          for attempt in 1 2 3 4 5 6 7 8; do
+            response=$(curl -sS -o /dev/null -m 10 -w '%{http_code} %{redirect_url}' \
+              -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36' \
+              -H 'Accept: text/html' "$APP_URL") || response=""
+            code="${response%% *}"
+            location="${response#* }"
+            case "$location" in
+              https://*.cloudflareaccess.com/cdn-cgi/access/login*)
+                exit 0 ;;
+            esac
+            if [ -n "$code" ] && [ "$code" -ge 200 ] && [ "$code" -lt 500 ] && [ "$code" != 404 ]; then
+              echo "::error::$APP_URL responded (HTTP $code) WITHOUT a Cloudflare Access login redirect. The app may be public; check its Access application now."
+              exit 1
+            fi
+            echo "attempt $attempt: not up yet (${response:-no response})"
+            sleep 5
+          done
+          echo "::error::Could not verify Cloudflare Access protection for $APP_URL after 8 attempts; re-run this job or verify manually"
+          exit 1
+
+      - name: Verify Managed OAuth
+        if: steps.decide.outputs.deploy == 'true'
+        run: |
+          body=$(curl -fsS -m 10 "$APP_URL/.well-known/oauth-authorization-server") || body=""
+          case "$body" in
+            *registration_endpoint*) exit 0 ;;
+          esac
+          echo "::error::$APP_URL/.well-known/oauth-authorization-server has no registration_endpoint, so MCP clients can't connect. Re-enable Managed OAuth on the Access application, keeping the Cursor redirect URIs."
+          exit 1
+
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          TAG: ${{ steps.decide.outputs.tag }}
+          MERGE: ${{ steps.decide.outputs.merge }}
+          DEPLOY: ${{ steps.decide.outputs.deploy }}
+        run: |
+          if [ "$JOB_STATUS" != success ]; then
+            line="Self-host update failed${TAG:+ ($TAG)}; see the job log."
+          elif [ "$MERGE" = true ]; then
+            line="Deployed upstream release $TAG."
+          elif [ "$DEPLOY" = true ]; then
+            line="Redeployed main (already on $TAG)."
+          else
+            line="Already up to date with upstream release $TAG."
+          fi
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
