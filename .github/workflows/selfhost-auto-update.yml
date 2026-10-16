@@ -9,8 +9,10 @@ name: Self-host auto-update
 #
 # Required repo secrets:
 # - CLOUDFLARE_API_TOKEN: Workers Scripts, Workers KV Storage, D1, Workers R2
-#   Storage write; Secrets Store read; Account Settings read; Access: Apps and
-#   Policies write; Access: Organizations, Identity Providers, and Groups read.
+#   Storage write; Secrets Store edit (Alchemy binds its state-store secret to
+#   a preview Worker, and Cloudflare rejects that with only read); Account
+#   Settings read; Access: Apps and Policies write; Access: Organizations,
+#   Identity Providers, and Groups read.
 # - CLOUDFLARE_ACCOUNT_ID
 # - ENV_SELFHOST: contents of .env.selfhost. After editing it locally, refresh
 #   with `gh secret set ENV_SELFHOST --repo sleekdotdesign/open-seo < .env.selfhost`.
