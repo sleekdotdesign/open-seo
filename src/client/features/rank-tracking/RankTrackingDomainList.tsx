@@ -2,15 +2,21 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { toast } from "sonner";
+import { RankRowsIllustration } from "@/client/components/EmptyIllustrations";
 import { LOCATIONS } from "@/client/features/keywords/locations";
 import {
   AlertTriangle,
   Archive,
   CircleAlert,
-  Globe,
+  Info,
   Plus,
   ChevronRight,
 } from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/client/components/ui/tooltip";
 import {
   getRankTrackingConfigSummaries,
   updateRankTrackingConfig,
@@ -29,6 +35,7 @@ import {
 import { ConfirmDialog } from "@/client/components/ConfirmDialog";
 import { EmptyState } from "@/client/components/EmptyState";
 import { GetCreditsButton } from "@/client/features/billing/InsufficientCreditsError";
+import { useCreditBalance } from "@/client/features/billing/useCreditBalance";
 import { Button } from "@/client/components/ui/button";
 import {
   Card,
@@ -47,6 +54,7 @@ import { Skeleton } from "@/client/components/ui/skeleton";
 import { useDebouncedDraft } from "@/client/hooks/useDebouncedDraft";
 import type { RankTrackingListSearch } from "@/types/schemas/rank-tracking-search";
 import { QueryError } from "@/client/components/QueryState";
+import { parseDbTimestamp } from "@/client/lib/db-timestamp";
 
 type ConfigSummary = Awaited<
   ReturnType<typeof getRankTrackingConfigSummaries>
@@ -193,9 +201,9 @@ export function RankTrackingDomainList({
           ) : !summaries ? null : summaries.length === 0 ? (
             <EmptyState
               variant="plain"
-              icon={Globe}
-              title="No tracked domains yet"
-              description="Add a domain to start monitoring keyword rankings over time."
+              illustration={<RankRowsIllustration />}
+              title="Track your Google rankings over time"
+              description="Add a domain and the keywords you care about to see when their positions move."
             />
           ) : filteredSummaries.length === 0 ? (
             <EmptyState
@@ -247,6 +255,25 @@ export function RankTrackingDomainList({
   );
 }
 
+/** A spent auto-reload budget holds credits back, so it isn't "out of credits". */
+function CreditsSkipNotice() {
+  const { autoReloadState } = useCreditBalance();
+  const reason =
+    autoReloadState === "budget_spent"
+      ? "monthly auto-reload budget reached"
+      : "out of credits";
+  return (
+    <div className="mt-1 flex items-center gap-2 text-xs text-destructive">
+      <CircleAlert className="size-3" />
+      Scheduled check skipped: {reason}
+      {/* Above the row link, like the archive button. */}
+      <span className="pointer-events-auto relative z-10">
+        <GetCreditsButton />
+      </span>
+    </div>
+  );
+}
+
 function DomainRow({
   projectId,
   summary,
@@ -289,19 +316,32 @@ function DomainRow({
             <>
               {" "}
               &middot; Last:{" "}
-              {new Date(summary.lastRunCompletedAt).toLocaleDateString()}
+              {parseDbTimestamp(
+                summary.lastRunCompletedAt,
+              ).toLocaleDateString()}
+              {summary.lastRunIncomplete && (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      // Above the row link, like the archive button.
+                      <span
+                        aria-label="Last check incomplete"
+                        className="pointer-events-auto relative z-10 ml-1 inline-flex cursor-help align-text-bottom"
+                      />
+                    }
+                  >
+                    <Info className="size-3.5" aria-hidden />
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    Some results from the last check are missing.
+                  </TooltipContent>
+                </Tooltip>
+              )}
             </>
           )}
         </p>
         {summary.lastSkipReason === "insufficient_credits" && (
-          <div className="mt-1 flex items-center gap-2 text-xs text-destructive">
-            <CircleAlert className="size-3" />
-            Scheduled check skipped: out of credits
-            {/* Above the row link, like the archive button. */}
-            <span className="pointer-events-auto relative z-10">
-              <GetCreditsButton />
-            </span>
-          </div>
+          <CreditsSkipNotice />
         )}
         {summary.lastSkipReason === "plan_required" && (
           <p className="flex items-center gap-1 text-xs text-warning">
