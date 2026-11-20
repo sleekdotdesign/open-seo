@@ -32,9 +32,9 @@ import {
  * The setup steps only show while the domain has no usable signature. Once
  * one is saved they collapse to a single line with the re-run button. An
  * unrendered crawl Shopify still rate limited with the signature asks for
- * rendering instead. On Every App, where CRAWLER_ACCESS_SECRET is optional,
- * the warning says to set it first when it isn't: a signature created too
- * early only runs down its expiry.
+ * rendering instead. Where CRAWLER_ACCESS_SECRET is optional (Every App and
+ * self-hosts), the warning says to set it first when it isn't: a signature
+ * created too early only runs down its expiry.
  */
 export function ShopifyCrawlWarning({
   projectId,
@@ -94,6 +94,7 @@ export function ShopifyCrawlWarning({
           maxPages: audit.config.maxPages,
           lighthouseStrategy: audit.config.lighthouseStrategy,
           renderJavaScript: audit.config.renderJavaScript,
+          excludePaths: audit.config.excludePaths,
         },
       }),
     onSuccess: (result) => {
